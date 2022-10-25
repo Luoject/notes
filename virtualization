@@ -1,0 +1,76 @@
+VM: Virtual Machine 虚拟机
+VMM: VM Monitor 虚机监控台，类似Hypervisor，用户空间和内核空间都有VMM
+Host: 宿主机
+Guest: 客户机
+KVM： Kernel-based VM
+KVM is a full virtualization solution for Linux on x86 hardware containing virtualization extensions (Intel VT or AMD-V).
+KVM将Intel VT-x(x86)上的硬件辅助虚拟化成果集成到Linux内核态中，用户态在QEMU(kvmtool)
+
+虚拟化的3个条件：等价性、高效性、资源控制
+
+QEMU是陷入和模拟模型，满足等价性、资源控制，但不满足高效性（是模拟）
+
+特权级压缩：Guest的用户指令运行在Host的用户模式，但Guest的特权指令也运行在Host的用户模式，这时处理器会触发异常，陷入VMM，由VMM执行特权指令
+但并不是所有Guest的特权指令，都需要陷入VMM执行
+
+敏感指令包括：特权指令(运行在ring0)和非特权的敏感指令(运行在ring1-3)
+
+ring0-ring3
+ring0:kernel
+ring1-2:device driver
+ring3:user
+
+x86架构虚拟化的障碍：Guest的非特权敏感指令运行在ring1-3，x86 Host不会将这些指令交给VMM处理
+解决方案：
+1、动态翻译指令，如果是非特权敏感指令，就交给VMM处理
+2、Intel VT技术(虚拟化扩展技术)，VMX root mode和VMX non-root mode，VM_entry和VM_exit，让Guest的kernel运行在Guest的ring0中，不会被特权级压缩到Host的用户模式
+
+VMX：基于处理器硬件实现的虚拟化
+VM_entry：从Host进入Guest
+VM_exit：从Guest返回Host
+VMCS：保存VM_entry和VM_exit过程中的上下文
+
+VCPU是Host虚拟出来的cpu处理器
+VM是Host上的进程，VCPU是同一个VM里的线程
+
+在Guest里，感知不到cpuid信息，只知道cpu型号，因此在Guest里的核间中断，要切换到Host的VMM处理
+
+访问外设IO的方式：PIO(programmed IO)、MMIO(memory-mapped IO)
+MMIO：将IO映射到内存地址空间，而非IO地址空间，cpu只需要访问映射的内存，即可以访问IO
+PIO：cpu通过in\out\ins\outs指令直接访问IO
+
+Guest访问MMIO，产生缺页异常，回到Host的KVM，KVM无法映射出内存页，就只能模拟Guest访问MMIO过程
+
+APIC：Advanced Programmable Interrupt Controller 可编程中断控制器
+LAPIC：Local APIC 处理器特有的APIC，多用于SMP的核间中断
+Intel支持一种专门的虚拟机退出原因：apic access
+
+cpuid指令、hlt指令是敏感指令，需要Host的KVM执行
+
+KVM模拟cpuid指令
+
+KVM模拟hlt指令
+
+
+嵌入式弹性底座
+弹性Elastic：Hypervisor把物理硬件抽象成vcpu、vmem、vgic、virtio，OS作为虚拟机运行在它们之上。Hypervisor弹性地部署OS，弹性体现在分时共享硬件资源，提高资源利用率。
+
+1、高效地混合部署
+2、高效地通信与协作
+3、高效地隔离与保护
+4、高效的资源共享与调度
+
+轻量级容器虚拟化
+Cgroups：谷歌发布的进程容器(Process Containers)，提供一系列进程级资源隔离技术，包括cpu、内存、IO
+LXC(Linux Containers)：Linux推出的Cgroups+Namespace，Cgroups按照进程组的维度隔离资源，并用Namespace标识进程组。容器Containers只支持运行在同一个宿主操作系统上，不能跨操作系统。
+Docker：基于LXC技术，Docker公司推出开源容器引擎Docker，工作方式：只读的静态镜像+可写的动态容器，并提供一套创建、注册、部署、管理的容器工具集。
+K8S(Kubernetes)：基于Docker，谷歌推出容器的集群管理平台K8S，自动化管理容器，解决大规模容器的编排、管理、调度问题。后续演化：Faas、PaaS等等。
+
+虚拟化
+硬件虚拟化：QEMU，虚拟硬件包括vcpu、vmem、vgic、virtio等，QEMU自身支持纯软件模拟（非虚拟化），结合KVM可以实现对硬件访问的全虚拟化。
+操作系统级虚拟化（系统虚拟化）：虚拟机，Libvirt接口支持创建、删除、暂停、迁移虚拟机。
+进程级虚拟化：容器
+应用程序级虚拟化：沙箱
+
+在虚拟化中，Hypervisor向下负责管理物理硬件资源（硬件虚拟化），向上完成Guest虚拟机的敏感指令请求（系统虚拟化）。
+KVM/QEMU就是一个Hypervisor方案
