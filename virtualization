@@ -74,3 +74,172 @@ K8S(Kubernetes)：基于Docker，谷歌推出容器的集群管理平台K8S，�
 
 在虚拟化中，Hypervisor向下负责管理物理硬件资源（硬件虚拟化），向上完成Guest虚拟机的敏感指令请求（系统虚拟化）。
 KVM/QEMU就是一个Hypervisor方案
+
+
+
+
+
+以Zephyr Client OS，QEMU平台为例，讲解混合部署Client OS。
+https://github.com/zephyrproject-rtos/zephyr/tree/main/subsys/ipc/rpmsg_service
+https://github.com/vonhust/zephyr/tree/mcs_rpi/drivers/ipm/ipm_gic_sgi.c
+
+一、Client OS侧：将libmetal、openamp代码移植进Client OS，生成clientos.bin
+1、libmetal、openamp使用v2022.04版本
+https://github.com/OpenAMP/libmetal/tree/v2022.04
+https://github.com/OpenAMP/open-amp/tree/v2022.04
+
+OpenAMP <- IPI <- IPM <- SGI7
+2、openamp依赖IPI（核间中断），在Linux侧初始化软中断SGI作为IPI（已完成），Client OS侧不能再重复初始化SGI，Client OS只要完成使能SGI、实现SGI的ISR中断服务程序、实现SGI的中断发送接口的工作。
+
+注意：在ARM中，中断SGI虽然是CPU核私有的，但是openamp要求Linux和Client OS使用同一个IPI，所以Client OS在选用SGI时，还要考虑Linux的SGI占用情况。在Linux中，SGI0-6已被Linux内核占用，SGI8-15已被ARM EL3安全固件占用，所以仅SGI7可用。
+
+为什么openamp要求Linux和Client OS使用同一个IPI？
+在GIC中，SGI0-15的中断路由是硬件配置好的，各CPU间的同一个SGI是连接好的。假设有4个CPU，SGI7已初始化好（由Linux初始化），当CPU0发送SGI7时，可以指定到达CPU1-3。如果CPU1使能了SGI7（包括使能中断号7的发送和接收），CPU1就会上报中断号7，即能接收到来自CPU0的SGI7。
+
+（1）Zephyr使用IPM作为IPI，初始化和使能IPM(Inter-process mailbox)
+【1】初始化IPM队列，注册中断服务程序
+	/* Start IPM workqueue */
+	k_work_queue_start(&ipm_work_q, ipm_stack_area,
+			   K_THREAD_STACK_SIZEOF(ipm_stack_area),
+			   IPM_WORK_QUEUE_PRIORITY, NULL);
+	k_thread_name_set(&ipm_work_q.thread, "ipm_work_q");
+
+	/* Setup IPM workqueue item */
+	k_work_init(&ipm_work, ipm_callback_process);
+		…
+		gic_sgi_irq_config_func_0
+			IRQ_CONNECT(7, IRQ_DEFAULT_PRIORITY,
+gic_sgi_isr, DEVICE_DT_INST_GET(0), 0)   #注册SGI7的中断服务程序
+【2】使用SGI7实现IPM，对齐Linux，，使能中断
+	ipm_handle = device_get_binding(CONFIG_RPMSG_SERVICE_IPM_NAME);
+	ipm_register_callback(ipm_handle, ipm_callback, NULL);
+	err = ipm_set_enabled(ipm_handle, 1);
+		…
+		gic_sgi_irq_config_func_0
+			irq_enable(7)   #使能SGI7
+（2）使用IPM发送中断
+virtio_notify
+	ipm_send
+		…
+		gic_sgi_send
+			gic_raise_sgi(7, cpu_id, cpu_mask)   #发送SGI7给Linux
+（3）使用IPM接收中断
+ipm_callback
+	k_work_submit_to_queue(&ipm_work_q, &ipm_work);
+
+ipm_callback_process
+	virtqueue_notification(vq[1]);
+
+OpenAMP <- virtio device <- shm <- libmetal配置
+3、实现libmetal底层接口
+（1）初始化日志接口
+	err = metal_init(&metal_params);
+
+（2）初始化virtio device shm共享内存
+	err = metal_register_generic_device(&shm_device);
+
+static metal_phys_addr_t shm_physmap[] = { SHM_START_ADDR };
+static struct metal_device shm_device = {
+	.name = SHM_DEVICE_NAME,
+	.bus = NULL,
+	.num_regions = 1,
+	{
+		{
+			.virt       = (void *) SHM_START_ADDR,
+			.physmap    = shm_physmap,
+			.size       = SHM_SIZE,
+			.page_shift = DEFAULT_PAGE_SHIFT,
+			.page_mask  = DEFAULT_PAGE_MASK,
+			.mem_flags  = 0,
+			.ops        = { NULL },
+		},
+	},
+	.node = { NULL },
+	.irq_num = 0,
+	.irq_info = NULL
+};
+
+注意：openamp依赖vdev内存，vdev内存包括shm内存和vdev_status内存。openamp要求Linux和Client OS使用同一片共享内存。在QEMU中，vdev内存需选用设备内存类型。以下是Zephyr openamp内存布局，供参考。
+vdev
+(0x70000000-0x7002ffff)	shm(0x70004000-0x7002ffff)	vring_tx(0x7002c000-0x7002ffff)
+		vring_rx(0x70028000-0x7002bfff)
+		…
+	vdev_status(0x70000000-0x70003fff)
+
+（3）获取shm对应的io空间，供vdev设备使用
+	err = metal_device_open("generic", SHM_DEVICE_NAME, &device);
+	*io = metal_device_io_region(device, 0);
+
+4、初始化vdev设备，创建endpoint
+（1）初始化vdev设备，创建tx\rx virtqueue，实现vdev_status寄存器读写
+	/* Virtqueue setup */
+	vq[0] = virtqueue_allocate(VRING_SIZE);
+	vq[1] = virtqueue_allocate(VRING_SIZE);
+
+	rvrings[0].io = *io;
+	rvrings[0].info.vaddr = (void *)VRING_TX_ADDRESS;
+	rvrings[0].info.num_descs = VRING_SIZE;
+	rvrings[0].info.align = VRING_ALIGNMENT;
+	rvrings[0].vq = vq[0];
+
+	rvrings[1].io = *io;
+	rvrings[1].info.vaddr = (void *)VRING_RX_ADDRESS;
+	rvrings[1].info.num_descs = VRING_SIZE;
+	rvrings[1].info.align = VRING_ALIGNMENT;
+	rvrings[1].vq = vq[1];
+
+	vdev->role = RPMSG_ROLE;
+	vdev->vrings_num = VRING_COUNT;
+	vdev->func = &dispatch;
+	vdev->vrings_info = &rvrings[0];
+
+	err = rpmsg_init_vdev(&rvdev, &vdev, NULL, io, NULL);
+	rdev = rpmsg_virtio_get_rpmsg_device(&rvdev);
+
+virtio_get_status
+	return sys_read8(VDEV_STATUS_ADDR);
+
+virtio_set_status
+	sys_write8(status, VDEV_STATUS_ADDR);
+
+（2）创建endpoint，注册消息接收回调函数
+			err = rpmsg_create_ept(&endpoints[i].ep,
+						rdev,
+						endpoints[i].name,
+						RPMSG_ADDR_ANY,
+						RPMSG_ADDR_ANY,
+						uart_rpmsg_endpoint_cb,
+						rpmsg_service_unbind);
+
+5、编写简单的通信程序，与Linux通信
+（1）发送消息
+rpmsg_service_send
+	return rpmsg_send(&endpoints[endpoint_id].ep, data, len);
+
+（2）接收消息
+static int uart_rpmsg_endpoint_cb(struct rpmsg_endpoint *ept, void *data,
+		size_t len, uint32_t src, void *priv)
+{
+	/* TODO: receive messages */
+}
+
+
+二、Linux侧：加载clientos.bin，Linux与Client OS开始通信
+1、构建openeuler-image镜像，安装sdk，编译出rpmsg_main和mcs_km.ko，步骤参考下面README.md。
+https://gitee.com/openeuler/yocto-embedded-tools/tree/master/mcs
+
+2、启动QEMU，-m 1G指定物理内存大小，内核启动参数mem=768M指定系统内存大小，剩下256M（0x70000000-0x7fffffff）作为保留的设备内存，供openamp和加载clientos.bin使用。以下是QEMU内存布局，供参考。
+reserved device memory(0x70000000-0x7fffffff)	clientos.bin(0x7a000000-0x7fffffff)
+	…
+	vdev(0x70000000-0x7002ffff)
+system_ram(0x40000000-0x6fffffff)
+
+3、执行rpmsg_main
+./rpmsg_main -c [cpu_id] -t [target_binfile] -a [target_binaddress]
+
+cpu_id表示Client OS运行在哪个核上，比如运行在4核中的CPU3，则-c 3。
+target_binfile表示Client OS的bin file名字，比如叫做clientos.bin，则-t clientos.bin。
+target_binaddress表示Client OS从哪个地址开始运行，比如从0x7a000000开始运行，则-a 0x7a000000。在ARM64中，clientos.bin的加载地址就是运行地址。
+
+例子：./rpmsg_main -c 3 -t clientos.bin -a 0x7a000000
+
